@@ -1,156 +1,216 @@
-import sys
 import json
+import os
+from datetime import datetime
+import requests
 
-class Task:
-    """Blueprint for individual task items."""
-    def __init__(self, task_id, title, priority="Medium", is_completed=False):
-        self.id = task_id
-        self.title = title
-        self.priority = priority
-        self.is_completed = is_completed  
+API_URL = "https://api.open-meteo.com/v1/forecast"
+GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+HISTORY_FILE = "search_history.json"
 
-    def mark_complete(self):
-        self.is_completed = True
 
-    def to_dict(self):
-        
-        return {"id": self.id, "title": self.title,
-                "priority": self.priority, "is_completed": self.is_completed}
+# --- Pure Helper & Formatting Functions ---
 
-    @classmethod
-    def from_dict(cls, data):
-       
-        return cls(data["id"], data["title"], data["priority"], data["is_completed"])
+def normalize_city_name(city_input: str) -> str:
+    """Normalize input string by stripping whitespace and title-casing."""
+    if not city_input:
+        return ""
+    return " ".join(city_input.strip().split()).title()
 
-    def __str__(self):
-        status = "x" if self.is_completed else " "
-        return f"[{status}] #{self.id} | {self.title} ({self.priority} Priority)"
 
+def format_weather_report(city: str, temperature: float, temp_unit: str, 
+                          wind_speed: float, wind_unit: str, obs_time: str) -> str:
+    """Format weather metrics into a clean visual report."""
+    border = "+" + "-" * 42 + "+"
+    lines = [
+        border,
+        f"| Weather Report: {city:<24} |",
+        border,
+        f"| Observation Time : {obs_time:<20} |",
+        f"| Temperature      : {f'{temperature} {temp_unit}':<20} |",
+        f"| Wind Speed       : {f'{wind_speed} {wind_unit}':<20} |",
+        border
+    ]
+    return "\n".join(lines)
+
+
+def format_history_list(history: list) -> str:
+    """Format history list into a compact readable table."""
+    if not history:
+        return "No recent searches found."
     
-    def __repr__(self):
-        return f"Task({self.id!r}, {self.title!r}, {self.priority!r})"
-
-
-class UrgentTask(Task):
-    """NEW: A Task that is always High priority and prints with a 🔥."""
-    def __init__(self, task_id, title, is_completed=False):
-        super().__init__(task_id, title, priority="High", is_completed=is_completed)
-
-    def __str__(self):
-        return f"🔥 {super().__str__()}"
-
-
-class TaskManager:
-    """Manages a list of Task/UrgentTask instances plus persistence."""
-    def __init__(self):
-        self.tasks = []
-        self._next_id = 1
-
-    def add_task(self, title, priority="Medium", urgent=False):
+    headers = f"{'#':<3} | {'Timestamp':<19} | {'City':<15} | {'Temp':<10}"
+    divider = "-" * len(headers)
+    output = [headers, divider]
+    
+    for idx, entry in enumerate(history, 1):
+        temp_str = f"{entry.get('temperature')} {entry.get('temp_unit')}"
+        output.append(f"{idx:<3} | {entry.get('timestamp'):<19} | {entry.get('city'):<15} | {temp_str:<10}")
         
-        if urgent:
-            new_task = UrgentTask(self._next_id, title)
-        else:
-            new_task = Task(self._next_id, title, priority)
-        self.tasks.append(new_task)
-        print(f"✨ Task added: '{title}' with ID #{self._next_id}")
-        self._next_id += 1
+    return "\n".join(output)
+
+
+# --- Storage Functions ---
+
+def load_history(filepath: str = HISTORY_FILE) -> list:
+    """Load search history from a local JSON file."""
+    if not os.path.exists(filepath):
+        return []
+    try:
+        with open(filepath, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_search_history(city: str, temperature: float, temp_unit: str, filepath: str = HISTORY_FILE) -> None:
+    """Save successful lookup details to JSON history."""
+    history = load_history(filepath)
+    entry = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "city": city,
+        "temperature": temperature,
+        "temp_unit": temp_unit
+    }
+    history.insert(0, entry)  # Place recent search first
+    history = history[:20]     # Retain latest 20 items
+    
+    try:
+        with open(filepath, "w", encoding="utf-8") as file:
+            json.dump(history, file, indent=2)
+    except OSError as err:
+        print(f"Warning: Failed to record search history: {err}")
+
+
+# --- API Fetching Functions ---
+
+def geocode_city(city_name: str) -> tuple:
+    """Fetch coordinates for a given city name."""
+    try:
+        response = requests.get(GEOCODING_URL, params={"name": city_name, "count": 1}, timeout=10)
+        response.raise_for_status()
+        data = response.json()
         
-        
-        self.save_to_file()
-
-    def list_all_tasks(self):
-        if not self.tasks:
-            print("📭 No tasks currently registered!")
-            return
-        print("\n--- CURRENT TASK LIST ---")
-        for task in self.tasks:
-            print(task)  
-        print("-------------------------\n")
-
-    def complete_task(self, task_id):
-        for task in self.tasks:
-            if task.id == task_id:
-                task.mark_complete()
-                print(f"🎉 Task #{task_id} marked as completed!")
-                
-             
-                self.save_to_file()
-                return
-        print(f"❌ Error: Task #{task_id} not found.")
-
-    def save_to_file(self, filename="tasks.json"):
-        data = [task.to_dict() for task in self.tasks]
-        with open(filename, "w") as f:
-            json.dump(data, f, indent=2)
-        print(f"💾 Saved {len(self.tasks)} tasks to {filename}")
-
-    def load_from_file(self, filename="tasks.json"):
-        try:
-            with open(filename, "r") as f:
-                data = json.load(f)
+        results = data.get("results")
+        if not results:
+            return None, None, None
             
-            self.tasks = []
-            for item in data:
-                if item["priority"] == "High":
-                    self.tasks.append(UrgentTask(item["id"], item["title"], item["is_completed"]))
-                else:
-                    self.tasks.append(Task.from_dict(item))
-            self._next_id = max((t.id for t in self.tasks), default=0) + 1
-            print(f"📂 Loaded {len(self.tasks)} tasks from {filename}")
-        except FileNotFoundError:
-            print(f"ℹ️ No saved file found at {filename} — starting fresh.")
+        first_result = results[0]
+        resolved_name = f"{first_result['name']}, {first_result.get('country_code', '').upper()}"
+        return resolved_name, first_result["latitude"], first_result["longitude"]
+    except requests.RequestException as error:
+        print(f"\n[Network Error] Geocoding request failed: {error}")
+        return None, None, None
 
-    def get_stats(self):
-        total = len(self.tasks)
-        completed = sum(1 for t in self.tasks if t.is_completed)
-        print(f"\n📊 STATS: Total: {total} | Completed: {completed} | Pending: {total - completed}\n")
 
+def get_weather(city: str, unit_system: str = "celsius") -> None:
+    """Fetch and display weather data for a specified city."""
+    resolved_city, lat, lon = geocode_city(city)
+    if not lat or not lon:
+        print(f"\nCould not find coordinates for city '{city}'. Please verify the spelling.")
+        return
+
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,wind_speed_10m",
+        "timezone": "auto"
+    }
+    
+    if unit_system == "fahrenheit":
+        params["temperature_unit"] = "fahrenheit"
+        params["wind_speed_unit"] = "mph"
+
+    try:
+        response = requests.get(API_URL, params=params, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        
+        current = payload["current"]
+        units = payload.get("current_units", {})
+        
+        temperature = current["temperature_2m"]
+        wind_speed = current["wind_speed_10m"]
+        obs_time = current.get("time", "N/A").replace("T", " ")
+        
+        temp_unit = units.get("temperature_2m", "°C" if unit_system == "celsius" else "°F")
+        wind_unit = units.get("wind_speed_10m", "km/h" if unit_system == "celsius" else "mph")
+        
+        report = format_weather_report(resolved_city, temperature, temp_unit, wind_speed, wind_unit, obs_time)
+        print(f"\n{report}\n")
+        
+        save_search_history(resolved_city, temperature, temp_unit)
+
+    except requests.RequestException as error:
+        print(f"\n[Network Error] Could not contact the weather service: {error}")
+    except (ValueError, KeyError, TypeError) as error:
+        print(f"\n[Data Error] Unexpected weather service response: {error}")
+
+
+# --- Tests (Offline Execution) ---
+
+def run_pure_tests():
+    """Run unit tests on pure formatting and normalization functions."""
+    assert normalize_city_name("  tbilisi  ") == "Tbilisi"
+    assert normalize_city_name("NEW   YORK") == "New York"
+    assert normalize_city_name("") == ""
+    
+    formatted = format_weather_report("Tbilisi", 22.5, "°C", 12.0, "km/h", "2026-10-03 09:00")
+    assert "Tbilisi" in formatted
+    assert "22.5 °C" in formatted
+    
+    mock_history = [{"timestamp": "2026-10-03 09:00", "city": "Tbilisi", "temperature": 22.5, "temp_unit": "°C"}]
+    history_out = format_history_list(mock_history)
+    assert "Tbilisi" in history_out
+    
+    print("All pure function unit tests passed successfully!")
+
+
+# --- Interactive CLI Interface ---
 
 def main():
-    manager = TaskManager()
-    manager.load_from_file()  
-
+    run_pure_tests()  # Run assertion checks on startup
+    unit_preference = "celsius"
+    
     while True:
-        print("=== OOP TASK MANAGER (v2) ===")
-        print("1. View All Tasks")
-        print("2. Add New Task")
-        print("3. Add URGENT Task")  
-        print("4. Mark Task Complete")
-        print("5. View Summary Stats")
-        print("6. Save & Exit")  
-
-        choice = input("\nSelect option (1-6): ").strip()
-
+        print("=== Open-Meteo Weather CLI ===")
+        print("1. Search City Weather")
+        print("2. View Search History")
+        print(f"3. Change Units (Current: {unit_preference.capitalize()})")
+        print("4. Exit")
+        
+        choice = input("Select an option (1-4): ").strip()
+        
         if choice == "1":
-            manager.list_all_tasks()
+            raw_city = input("Enter city name: ")
+            city = normalize_city_name(raw_city)
+            if not city:
+                print("\n[Input Validation Error] City name cannot be empty.\n")
+                continue
+            get_weather(city, unit_preference)
+            
         elif choice == "2":
-            title = input("Enter task title: ").strip()
-            prio = input("Enter priority (Low/Medium/High) [Medium]: ").strip() or "Medium"
-            if title:
-                manager.add_task(title, prio)
-            else:
-                print("❌ Title cannot be empty!")
+            history = load_history()
+            print(f"\n{format_history_list(history)}\n")
+            
         elif choice == "3":
-            title = input("Enter urgent task title: ").strip()
-            if title:
-                manager.add_task(title, urgent=True)  
+            print("\nSelect Unit:")
+            print("1. Celsius (°C, km/h)")
+            print("2. Fahrenheit (°F, mph)")
+            unit_choice = input("Choice (1-2): ").strip()
+            if unit_choice == "1":
+                unit_preference = "celsius"
+                print("\nUnit updated to Celsius.\n")
+            elif unit_choice == "2":
+                unit_preference = "fahrenheit"
+                print("\nUnit updated to Fahrenheit.\n")
             else:
-                print("❌ Title cannot be empty!")
+                print("\nInvalid choice. Keeping default unit.\n")
+                
         elif choice == "4":
-            tid = input("Enter Task ID to complete: ").strip()
-            if tid.isdigit():
-                manager.complete_task(int(tid))
-            else:
-                print("❌ Please enter a valid numerical ID.")
-        elif choice == "5":
-            manager.get_stats()
-        elif choice == "6":
-            manager.save_to_file()  
-            print("👋 Saved! Happy coding.")
-            sys.exit(0)
+            print("Goodbye!")
+            break
         else:
-            print("⚠️ Invalid option. Please enter a number between 1 and 6.")
+            print("\n[Input Validation Error] Invalid menu choice. Enter a number between 1 and 4.\n")
 
 
 if __name__ == "__main__":
